@@ -184,6 +184,22 @@ _DOCKER_MANIFEST_ACCEPT = ", ".join((
     "application/vnd.docker.distribution.manifest.list.v2+json",
     "application/vnd.docker.distribution.manifest.v2+json",
 ))
+# Reading the remote image config is content-addressed: every document is
+# requested BY DIGEST and verified against it, so the answer cannot be
+# swapped for another image. A digest never changes content, so the cache
+# has no TTL — only a bound.
+_DOCKER_REMOTE_CONFIG_MAX_BYTES = 1 << 20
+_DOCKER_REMOTE_CONFIG_CACHE_MAX = 500
+_DOCKER_INDEX_MEDIA_TYPES = {
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+}
+_DOCKER_IMAGE_CONFIG_MEDIA_TYPES = {
+    "application/vnd.oci.image.config.v1+json",
+    "application/vnd.docker.container.image.v1+json",
+}
+_docker_remote_config_lock = threading.RLock()
+_docker_remote_config_cache: dict[tuple, dict] = {}
 _docker_inventory_lock = threading.RLock()
 _docker_inventory_cache: dict[str, dict] = {}
 
@@ -1653,6 +1669,22 @@ def _normalise_docker_display_version(value: Any) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def _docker_version_from_labels(
+    labels: dict,
+    keys: tuple = ("Version", "version", "org.opencontainers.image.version"),
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve a version from image labels, in the caller's order of trust.
+
+    Shared by the local image inspect and by the remote image config so both
+    sides of the comparison read the same labels through the same filter.
+    """
+    for key in keys:
+        version = _normalise_docker_display_version((labels or {}).get(key))
+        if version:
+            return version, f"image_label:{key}"
+    return None, None
+
+
 def _docker_version_from_image_inspect(parsed: dict, inspected: dict) -> tuple[Optional[str], Optional[str]]:
     """Resolve an installed image version from local, immutable evidence."""
     direct_tag = _normalise_docker_display_version(parsed.get("tag"))
@@ -1662,10 +1694,9 @@ def _docker_version_from_image_inspect(parsed: dict, inspected: dict) -> tuple[O
     labels = ((inspected.get("Config") or {}).get("Labels") or {})
     # Application-specific labels take precedence over OCI labels because a
     # few publishers put the base distribution version in the latter.
-    for key in ("Version", "version"):
-        version = _normalise_docker_display_version(labels.get(key))
-        if version:
-            return version, f"image_label:{key}"
+    version, source = _docker_version_from_labels(labels, ("Version", "version"))
+    if version:
+        return version, source
 
     # A moving tag often shares an image ID with an explicit release tag
     # already present locally (for example frigate:stable + frigate:0.17.2).
@@ -1686,10 +1717,7 @@ def _docker_version_from_image_inspect(parsed: dict, inspected: dict) -> tuple[O
         alternate_versions.sort(key=_docker_tag_semver_key, reverse=True)
         return alternate_versions[0], "local_equivalent_tag"
 
-    version = _normalise_docker_display_version(labels.get("org.opencontainers.image.version"))
-    if version:
-        return version, "image_label:org.opencontainers.image.version"
-    return None, None
+    return _docker_version_from_labels(labels, ("org.opencontainers.image.version",))
 
 
 def _docker_hub_version_for_digest(records: list[dict], digest: Optional[str]) -> Optional[str]:
@@ -1963,6 +1991,166 @@ def _fetch_registry_manifest_digest(parsed: dict) -> tuple[Optional[str], Option
         "User-Agent": "ProxMenux-Monitor",
         "Accept": _DOCKER_MANIFEST_ACCEPT,
     })
+
+
+def _verify_content_digest(body: bytes, digest: str) -> bool:
+    """Every registry document is named by its own sha256; check it."""
+    algorithm, _, want = str(digest or "").partition(":")
+    if algorithm != "sha256" or not want or body is None:
+        return False
+    return hashlib.sha256(body).hexdigest() == want
+
+
+def _select_platform_manifest(index: dict, platform: dict) -> Optional[str]:
+    """Return the manifest digest matching the locally installed platform.
+
+    Multi-arch indexes also carry attestation manifests, which advertise
+    ``unknown/unknown``: their config is an SLSA provenance document, not an
+    image. Picking "the first entry" would read that instead. A missing match
+    yields None rather than a fallback — if the index has no build for this
+    host, a pull would fail and there is no version to report.
+    """
+    def _norm(entry: dict) -> tuple:
+        os_name = str(entry.get("os") or "").lower()
+        architecture = str(entry.get("architecture") or "").lower()
+        variant = str(entry.get("variant") or "").lower()
+        # arm64/v8 and bare arm64 name the same build.
+        if architecture == "arm64" and variant == "v8":
+            variant = ""
+        return os_name, architecture, variant
+
+    want = _norm(platform or {})
+    if not want[0] or not want[1]:
+        return None
+    for entry in (index or {}).get("manifests") or []:
+        if not isinstance(entry, dict):
+            continue
+        if (entry.get("annotations") or {}).get("vnd.docker.reference.type"):
+            continue
+        candidate = _norm(entry.get("platform") or {})
+        if candidate[0] in ("", "unknown") or candidate[1] in ("", "unknown"):
+            continue
+        if candidate != want:
+            continue
+        digest = str(entry.get("digest") or "")
+        if digest.startswith("sha256:"):
+            return digest
+    return None
+
+
+def _registry_get_document(base: str, digest: str, headers: dict, token: Optional[str],
+                           ) -> tuple[Optional[dict], Optional[str], Optional[str]]:
+    """GET a registry document by digest and verify it. Returns (json, token, error)."""
+    _response, body, token, error = _registry_request(
+        f"{base}/manifests/{urllib.parse.quote(digest, safe=':')}", headers,
+        method="GET", token=token, max_bytes=_DOCKER_REMOTE_CONFIG_MAX_BYTES,
+    )
+    if error:
+        return None, token, error
+    if not _verify_content_digest(body, digest):
+        return None, token, "remote manifest digest mismatch"
+    try:
+        return json.loads(body.decode("utf-8")), token, None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, token, "remote manifest was not valid JSON"
+
+
+def _remote_image_config_labels(parsed: dict, remote_digest: str, platform: dict,
+                                ) -> tuple[Optional[dict], Optional[str]]:
+    base = f"https://{parsed.get('api_host')}/v2/{urllib.parse.quote(parsed.get('repository') or '', safe='/')}"
+    headers = {"User-Agent": "ProxMenux-Monitor", "Accept": _DOCKER_MANIFEST_ACCEPT}
+
+    manifest, token, error = _registry_get_document(base, remote_digest, headers, None)
+    if error:
+        return None, error
+    media_type = str(manifest.get("mediaType") or "")
+    if media_type in _DOCKER_INDEX_MEDIA_TYPES or "manifests" in manifest:
+        platform_digest = _select_platform_manifest(manifest, platform)
+        if not platform_digest:
+            return None, "remote_platform_missing"
+        manifest, token, error = _registry_get_document(base, platform_digest, headers, token)
+        if error:
+            return None, error
+    config = manifest.get("config") or {}
+    config_digest = str(config.get("digest") or "")
+    if (str(config.get("mediaType") or "") not in _DOCKER_IMAGE_CONFIG_MEDIA_TYPES
+            or not config_digest.startswith("sha256:")):
+        # Schema v1 manifests and non-image OCI artifacts (Helm charts,
+        # signatures) have no image config to read.
+        return None, "remote_unsupported_manifest"
+    _response, body, _token, error = _registry_request(
+        f"{base}/blobs/{urllib.parse.quote(config_digest, safe=':')}",
+        {"User-Agent": "ProxMenux-Monitor", "Accept": "*/*"},
+        method="GET", token=token, max_bytes=_DOCKER_REMOTE_CONFIG_MAX_BYTES,
+    )
+    if error:
+        return None, error
+    if not _verify_content_digest(body, config_digest):
+        return None, "remote config digest mismatch"
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, "remote config was not valid JSON"
+    return ((payload.get("config") or {}).get("Labels") or {}), None
+
+
+def _fetch_remote_image_config_labels(parsed: dict, remote_digest: str, platform: dict,
+                                      ) -> tuple[Optional[dict], Optional[str]]:
+    """Cached read of the labels carried by the image a pull would install."""
+    cache_key = (
+        str(parsed.get("api_host") or ""),
+        str(parsed.get("repository") or ""),
+        str(remote_digest or ""),
+        str((platform or {}).get("architecture") or ""),
+    )
+    with _docker_remote_config_lock:
+        cached = _docker_remote_config_cache.get(cache_key)
+    if cached is not None:
+        return cached.get("labels"), cached.get("error")
+    labels, error = _remote_image_config_labels(parsed, remote_digest, platform)
+    with _docker_remote_config_lock:
+        if len(_docker_remote_config_cache) >= _DOCKER_REMOTE_CONFIG_CACHE_MAX:
+            _docker_remote_config_cache.clear()
+        _docker_remote_config_cache[cache_key] = {"labels": labels, "error": error}
+    return labels, error
+
+
+_DOCKER_AVAILABLE_VERSION_REASONS = {
+    "remote_platform_missing", "remote_unsupported_manifest", "remote_no_labels",
+}
+
+
+def _docker_available_version_from_registry(item: dict) -> tuple[Optional[str], str]:
+    """Version of the image that pulling this same tag would install.
+
+    This is deliberately not "the latest upstream release": the update action
+    this project generates re-pulls the SAME tag, so the honest number is the
+    one the registry is serving for it right now. Anything that cannot be
+    established returns no version and a reason, keeping the existing contract
+    that a new digest is reported without claiming a version number.
+    """
+    remote_digest = item.get("remote_digest")
+    if not remote_digest:
+        return None, "remote_fetch_error"
+    labels, error = _fetch_remote_image_config_labels(
+        item, remote_digest, item.get("platform") or {},
+    )
+    if error:
+        return None, error if error in _DOCKER_AVAILABLE_VERSION_REASONS else "remote_fetch_error"
+    version, source = _docker_version_from_labels(labels or {})
+    if not version:
+        return None, "remote_no_labels"
+    installed_source = str(item.get("installed_version_source") or "")
+    if installed_source.startswith("image_label:") and installed_source != source:
+        # Comparing one publisher's label against a different one invents a
+        # difference that is not there.
+        return None, "version_source_mismatch"
+    installed = item.get("installed_version")
+    if installed and compare(installed, version) is not True:
+        # Same version rebuilt, retagged, or an unusable pair: the digest
+        # already says there is a new image; no number is the honest answer.
+        return None, "version_not_comparable"
+    return version, f"remote_{source}"
 
 
 def _parse_compose_depends_on(value: Any) -> list[str]:
@@ -2400,7 +2588,16 @@ def _docker_inventory_from_ct(vmid) -> dict:
             "logo_url": display_meta.get("logo_url"),
             "installed_version": installed_version,
             "installed_version_source": installed_version_source,
+            # The platform of the image actually installed here. A multi-arch
+            # index must be resolved to this exact build before its config can
+            # be read; anything else would describe a different binary.
+            "platform": {
+                "os": str(inspected_image.get("Os") or ""),
+                "architecture": str(inspected_image.get("Architecture") or ""),
+                "variant": str(inspected_image.get("Variant") or ""),
+            },
             "available_version": None,
+            "available_version_source": None,
             "update_available": None,
             "error": None,
         })
@@ -2449,6 +2646,30 @@ def _docker_inventory_from_ct(vmid) -> dict:
                     item["installed_version_source"] = "docker_hub_digest_tag"
             if item.get("update_available") is True:
                 available_version = _docker_hub_version_for_digest(records, item.get("remote_digest"))
+                if available_version and available_version != item.get("installed_version"):
+                    item["available_version"] = available_version
+                    item["available_version_source"] = "docker_hub_digest_tag"
+
+        # The shortcut above only covers docker.io, and only when a version
+        # tag happens to share the digest. Everywhere else — ghcr.io, lscr.io,
+        # quay.io — an available update had no version number at all. The
+        # image a pull would install carries its own version label, so read it
+        # from the registry by digest, over the same protocol and Bearer
+        # challenge the digest comparison already uses. Hub keeps priority on
+        # docker.io because its tag API is not a pull and does not consume the
+        # anonymous pull-rate budget, and because official images carry no
+        # labels at all.
+        pending = [
+            item for item in images
+            if item.get("update_available") is True
+            and not item.get("available_version")
+            and item.get("remote_digest")
+        ]
+        if pending:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(pending))) as pool:
+                resolved = list(pool.map(_docker_available_version_from_registry, pending))
+            for item, (available_version, source) in zip(pending, resolved):
+                item["available_version_source"] = source
                 if available_version and available_version != item.get("installed_version"):
                     item["available_version"] = available_version
 
