@@ -1835,45 +1835,124 @@ def _parse_bearer_challenge(value: str) -> Optional[dict]:
     return params
 
 
-def _registry_digest_request(url: str, headers: dict) -> tuple[Optional[str], Optional[str]]:
-    req = urllib.request.Request(url, headers=headers, method="HEAD")
+class _DockerNoRedirect(urllib.request.HTTPRedirectHandler):
+    """Surface 3xx instead of following it.
+
+    urllib re-sends ``Authorization`` to the redirect target; registries hand
+    blobs off to signed-URL storage that rejects a second auth mechanism, and
+    the official Docker client drops the header on a host change. Following
+    the hop by hand is the only way to drop it.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_docker_no_redirect_opener = urllib.request.build_opener(_DockerNoRedirect)
+
+
+def _registry_bearer_token(challenge: dict) -> tuple[Optional[str], Optional[str]]:
+    """Exchange a parsed ``WWW-Authenticate`` challenge for a pull token."""
+    query = {
+        key: challenge[key]
+        for key in ("service", "scope") if challenge.get(key)
+    }
+    token_url = challenge["realm"]
+    if query:
+        token_url += ("&" if "?" in token_url else "?") + urllib.parse.urlencode(query)
+    token_req = urllib.request.Request(
+        token_url,
+        headers={"User-Agent": "ProxMenux-Monitor", "Accept": "application/json"},
+    )
     try:
-        with urllib.request.urlopen(req, timeout=_DOCKER_REGISTRY_TIMEOUT_SEC) as response:
-            return response.headers.get("Docker-Content-Digest"), None
+        with urllib.request.urlopen(token_req, timeout=_DOCKER_REGISTRY_TIMEOUT_SEC) as response:
+            token_payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        if exc.code != 401:
-            return None, f"registry HTTP {exc.code}"
-        challenge = _parse_bearer_challenge(exc.headers.get("WWW-Authenticate", ""))
-        if not challenge:
-            return None, "registry authentication required"
-        query = {
-            key: challenge[key]
-            for key in ("service", "scope") if challenge.get(key)
-        }
-        token_url = challenge["realm"]
-        if query:
-            token_url += ("&" if "?" in token_url else "?") + urllib.parse.urlencode(query)
-        token_req = urllib.request.Request(
-            token_url,
-            headers={"User-Agent": "ProxMenux-Monitor", "Accept": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(token_req, timeout=_DOCKER_REGISTRY_TIMEOUT_SEC) as response:
-                token_payload = json.loads(response.read().decode("utf-8"))
-            token = token_payload.get("token") or token_payload.get("access_token")
-            if not token:
-                return None, "registry token response was empty"
-            auth_headers = dict(headers)
-            auth_headers["Authorization"] = f"Bearer {token}"
-            auth_req = urllib.request.Request(url, headers=auth_headers, method="HEAD")
-            with urllib.request.urlopen(auth_req, timeout=_DOCKER_REGISTRY_TIMEOUT_SEC) as response:
-                return response.headers.get("Docker-Content-Digest"), None
-        except urllib.error.HTTPError as auth_exc:
-            return None, f"registry HTTP {auth_exc.code}"
-        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as auth_exc:
-            return None, f"registry network error: {auth_exc}"
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return None, f"registry HTTP {exc.code}"
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         return None, f"registry network error: {exc}"
+    token = token_payload.get("token") or token_payload.get("access_token")
+    if not token:
+        return None, "registry token response was empty"
+    return token, None
+
+
+def _registry_open(url: str, headers: dict, method: str, max_bytes: int):
+    """One registry request. Returns (headers, body, status, location, error)."""
+    req = urllib.request.Request(url, headers=headers, method=method)
+    try:
+        with _docker_no_redirect_opener.open(req, timeout=_DOCKER_REGISTRY_TIMEOUT_SEC) as response:
+            body = None
+            if max_bytes > 0:
+                body = response.read(max_bytes + 1)
+                if len(body) > max_bytes:
+                    return None, None, None, None, "registry response exceeded the size limit"
+            return response.headers, body, 200, None, None
+    except urllib.error.HTTPError as exc:
+        if exc.code in (301, 302, 303, 307, 308):
+            return exc.headers, None, exc.code, exc.headers.get("Location"), None
+        if exc.code == 401:
+            return exc.headers, None, 401, None, None
+        return None, None, exc.code, None, f"registry HTTP {exc.code}"
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return None, None, None, None, f"registry network error: {exc}"
+
+
+def _registry_request(url: str, headers: dict, method: str = "HEAD",
+                      token: Optional[str] = None, max_bytes: int = 0,
+                      follow_redirect: bool = True):
+    """Registry request resolving a Bearer challenge once.
+
+    Returns (headers, body, token, error). The token is returned so a caller
+    walking manifest -> manifest -> blob pays for a single challenge.
+    """
+    attempt_headers = dict(headers)
+    if token:
+        attempt_headers["Authorization"] = f"Bearer {token}"
+    response_headers, body, status, location, error = _registry_open(
+        url, attempt_headers, method, max_bytes,
+    )
+    if error:
+        return None, None, token, error
+    if status == 401:
+        challenge = _parse_bearer_challenge((response_headers or {}).get("WWW-Authenticate", ""))
+        if not challenge:
+            return None, None, token, "registry authentication required"
+        token, token_error = _registry_bearer_token(challenge)
+        if token_error:
+            return None, None, None, token_error
+        attempt_headers["Authorization"] = f"Bearer {token}"
+        response_headers, body, status, location, error = _registry_open(
+            url, attempt_headers, method, max_bytes,
+        )
+        if error:
+            return None, None, token, error
+        if status == 401:
+            return None, None, token, "registry HTTP 401"
+    if location:
+        if not follow_redirect:
+            return None, None, token, "registry redirected unexpectedly"
+        if not location.startswith("https://"):
+            return None, None, token, "registry redirect was not https"
+        cdn_headers = {
+            key: value for key, value in headers.items()
+            if key.lower() != "authorization"
+        }
+        response_headers, body, status, location, error = _registry_open(
+            location, cdn_headers, method, max_bytes,
+        )
+        if error:
+            return None, None, token, error
+        if location:
+            return None, None, token, "registry redirected more than once"
+    return response_headers, body, token, None
+
+
+def _registry_digest_request(url: str, headers: dict) -> tuple[Optional[str], Optional[str]]:
+    response_headers, _body, _token, error = _registry_request(url, headers, method="HEAD")
+    if error:
+        return None, error
+    return (response_headers or {}).get("Docker-Content-Digest"), None
 
 
 def _fetch_registry_manifest_digest(parsed: dict) -> tuple[Optional[str], Optional[str]]:
