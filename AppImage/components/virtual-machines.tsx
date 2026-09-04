@@ -5613,9 +5613,23 @@ const handleDownloadLogs = async (vmid: number, vmName: string) => {
                                                   )}
                                                 </div>
                                                 <div className="min-w-0">
-                                                  <span className="font-mono text-foreground/90 block truncate" title={image.reference}>
-                                                    {image.reference}
-                                                  </span>
+                                                  {image.display_name ? (
+                                                    <>
+                                                      <span className="text-foreground block truncate" title={image.display_name}>
+                                                        {image.display_name}
+                                                      </span>
+                                                      <span
+                                                        className="font-mono text-xs text-muted-foreground block truncate"
+                                                        title={image.reference}
+                                                      >
+                                                        {image.reference}
+                                                      </span>
+                                                    </>
+                                                  ) : (
+                                                    <span className="font-mono text-foreground/90 block truncate" title={image.reference}>
+                                                      {image.reference}
+                                                    </span>
+                                                  )}
                                                   <div className="mt-1 text-xs text-muted-foreground flex items-center gap-1.5">
                                                     <Package className="h-3.5 w-3.5 flex-shrink-0" />
                                                     {image.installed_version ? (

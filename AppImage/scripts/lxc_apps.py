@@ -3596,12 +3596,19 @@ def _docker_stack_notification_payload(
         lines.append(f'• Docker Engine: {installed} → {latest}')
     for image in pending_images[:12]:
         reference = image.get('reference') or 'Docker image'
+        # Lead with the application when the catalog resolved one: the alert
+        # is read on a phone, where "vaultwarden/server:latest" is a worse
+        # answer to "what needs updating" than "Vaultwarden". The reference
+        # stays, because it is what the user acts on. The deduplication
+        # signature above keeps using the reference alone.
+        display_name = str(image.get('display_name') or '').strip()
+        label = f'{display_name} ({reference})' if display_name and display_name != reference else reference
         installed = image.get('installed_version')
         available = image.get('available_version')
         if installed and available and installed != available:
-            lines.append(f'• {reference}: {installed} → {available}')
+            lines.append(f'• {label}: {installed} → {available}')
         else:
-            lines.append(f'• {reference}: new registry digest')
+            lines.append(f'• {label}: new registry digest')
     if len(pending_images) > 12:
         lines.append(f'• +{len(pending_images) - 12} additional image update(s)')
     return {
@@ -4521,6 +4528,24 @@ def _probe_listening_ports(vmid) -> list[int]:
     return result
 
 
+def _docker_container_slug_index() -> dict:
+    """Map a declared ``container_name`` to the catalog slug that declares it.
+
+    Only detectors carrying curated runtime evidence appear here, which keeps
+    the mapping conservative: a container merely called "postgres" is not
+    claimed by an app, because no verified detector says it is.
+    """
+    index: dict = {}
+    for slug, hint in (_fetch_tracking_hints() or {}).items():
+        for detector in _iter_hint_detectors(hint):
+            if detector.get("installed_via") not in ("docker_label", "docker_exec"):
+                continue
+            name = str(detector.get("container_name") or "").strip().lower()
+            if name:
+                index.setdefault(name, slug)
+    return index
+
+
 def _docker_service_catalog_meta(service: str, container: str, image: str) -> dict:
     """Best-effort display metadata for a Docker workload.
 
@@ -4531,6 +4556,13 @@ def _docker_service_catalog_meta(service: str, container: str, image: str) -> di
     image_base = image.split("@", 1)[0].rsplit("/", 1)[-1].split(":", 1)[0]
     raw_candidates = [service, container, image_base]
     candidates: list[str] = []
+    # A curated docker detector names the container it runs in, which is the
+    # only reliable bridge from a container to its catalog entry: Immich's
+    # service is "immich-server" and its image is "immich-server", but the
+    # application is "immich". Heuristic name matching never gets there.
+    declared = _docker_container_slug_index().get(str(container or "").strip().lower())
+    if declared:
+        candidates.append(declared)
     for raw in raw_candidates:
         candidate = re.sub(r"[^a-z0-9._-]+", "-", str(raw or "").strip().lower()).strip("-._")
         if candidate and candidate not in candidates:

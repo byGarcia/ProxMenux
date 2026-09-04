@@ -259,3 +259,82 @@ class RegistryRedirectTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContainerIdentityTests(unittest.TestCase):
+    """A container's catalog identity comes from a detector that declares it."""
+
+    HINTS = {
+        "immich": {
+            "installed_via": "file",
+            "file_path": "/root/.immich",
+            "logo": "https://example.invalid/immich.webp",
+            "alt_detectors": [
+                {"installed_via": "docker_label", "container_name": "immich_server",
+                 "label": "org.opencontainers.image.version"},
+            ],
+        },
+        "netalertx": {
+            "installed_via": "docker_label",
+            "container_name": "netalertx",
+            "label": "org.opencontainers.image.version",
+        },
+        "postgresql": {"installed_via": "dpkg", "package": "postgresql"},
+    }
+
+    def test_index_covers_primary_and_alternate_detectors(self):
+        with mock.patch.object(lxc_apps, "_fetch_tracking_hints", lambda: self.HINTS):
+            index = lxc_apps._docker_container_slug_index()
+        self.assertEqual(index.get("immich_server"), "immich")
+        self.assertEqual(index.get("netalertx"), "netalertx")
+
+    def test_unclaimed_container_names_stay_out(self):
+        """A container merely called postgres is not an application claim."""
+        with mock.patch.object(lxc_apps, "_fetch_tracking_hints", lambda: self.HINTS):
+            index = lxc_apps._docker_container_slug_index()
+        self.assertNotIn("postgres", index)
+
+    def test_declared_container_resolves_a_name_heuristics_cannot(self):
+        with mock.patch.object(lxc_apps, "_fetch_tracking_hints", lambda: self.HINTS), \
+             mock.patch.object(lxc_apps, "_catalog_lookup", lambda slug: {"name": "Immich"} if slug == "immich" else None):
+            meta = lxc_apps._docker_service_catalog_meta(
+                "immich-server", "immich_server",
+                "ghcr.io/immich-app/immich-server:release",
+            )
+        self.assertEqual(meta["slug"], "immich")
+        self.assertEqual(meta["name"], "Immich")
+        self.assertEqual(meta["logo_url"], "https://example.invalid/immich.webp")
+
+
+class UpdateNotificationWordingTests(unittest.TestCase):
+    def test_alert_leads_with_the_application_name(self):
+        payload = lxc_apps._docker_stack_notification_payload(
+            102,
+            {"state": {}},
+            {"images": [{
+                "reference": "vaultwarden/server:latest",
+                "display_name": "Vaultwarden",
+                "installed_version": "1.37.2",
+                "available_version": "1.38.0",
+                "update_available": True,
+                "remote_digest": "sha256:" + "a" * 64,
+            }]},
+            "vaultwarden",
+        )
+        self.assertIsNotNone(payload)
+        self.assertIn("• Vaultwarden (vaultwarden/server:latest): 1.37.2 → 1.38.0", payload["details"])
+
+    def test_unnamed_image_keeps_its_reference(self):
+        payload = lxc_apps._docker_stack_notification_payload(
+            102,
+            {"state": {}},
+            {"images": [{
+                "reference": "valkey/valkey:8-bookworm",
+                "installed_version": None,
+                "available_version": None,
+                "update_available": True,
+                "remote_digest": "sha256:" + "b" * 64,
+            }]},
+            "immich",
+        )
+        self.assertIn("• valkey/valkey:8-bookworm: new registry digest", payload["details"])
