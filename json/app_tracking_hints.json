@@ -484,7 +484,7 @@
     "default_ports": [
       8083
     ],
-    "file_path": "/root/.calibre-web",
+    "file_path": "/root/.calibreweb",
     "file_regex": "(?i)(?:v|release[-_/]?)?(\\d+(?:\\.\\d+){1,3}(?:[-+._][0-9A-Za-z.-]+)?)",
     "github_source": "releases",
     "installed_via": "file",
@@ -1429,6 +1429,19 @@
     "repo": "Forceu/Gokapi",
     "tag_regex": "(?i)(?:v|release[-_/]?)?(\\d+(?:\\.\\d+){1,3}(?:[-+._][0-9A-Za-z.-]+)?)",
     "website": "https://github.com/Forceu/Gokapi"
+  },
+  "gotenberg": {
+    "default_ports": [
+      3000
+    ],
+    "file_path": "/root/.gotenberg",
+    "file_regex": "(?i)(?:v|release[-_/]?)?(\\d+(?:\\.\\d+){1,3}(?:[-+._][0-9A-Za-z.-]+)?)",
+    "github_source": "releases",
+    "installed_via": "file",
+    "logo": "https://gotenberg.dev/img/logo.png",
+    "repo": "gotenberg/gotenberg",
+    "tag_regex": "(?i)(?:v|release[-_/]?)?(\\d+(?:\\.\\d+){1,3}(?:[-+._][0-9A-Za-z.-]+)?)",
+    "website": "https://gotenberg.dev/"
   },
   "gotify": {
     "default_ports": [
